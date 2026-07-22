@@ -1,0 +1,26 @@
+# IDE
+.idea/
+.junie/
+
+# Build output
+.build/
+dist/
+
+# SwiftPM
+.swiftpm/
+
+# Xcode (this is a SwiftPM project, but guard against generated cruft)
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# macOS
+.DS_Store
+
+# Signing / notarization secrets — must never be committed
+*.p12
+*.cer
+*.p8
+*.provisionprofile
+notary*.json

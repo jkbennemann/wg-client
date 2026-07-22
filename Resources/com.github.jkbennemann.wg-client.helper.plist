@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.jkbennemann.wg-client.helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/PrivilegedHelperTools/WGClient/wireguard-client-helper</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- Interactive scheduling tier: the daemon spends most of its life idle but must
+         respond to connect/disconnect requests without background QoS throttling. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/wg-client-helper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/wg-client-helper.log</string>
+</dict>
+</plist>
