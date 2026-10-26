@@ -7,9 +7,17 @@ enum NetworkSetup {
     struct HostRoute: Codable, Equatable {
         var family: String  // "inet" | "inet6"
         var dest: String
-        /// Physical gateway the endpoint is pinned to; empty while there is none
-        /// (offline), in which case nothing is installed until the network returns.
+        /// Physical gateway the endpoint is pinned to, or loopback while there is none.
         var gateway: String
+
+        /// Stand-in gateway while offline: packets to the endpoint are dropped on lo0
+        /// instead of matching the tunnel's own /1 routes and looping through it. A plain
+        /// gateway route (not -blackhole), so `route change` re-points it in place later.
+        static func offlineGateway(family: String) -> String {
+            family == "inet6" ? "::1" : "127.0.0.1"
+        }
+
+        var isOffline: Bool { gateway == Self.offlineGateway(family: family) }
 
         fileprivate func args(_ verb: String) -> [String] {
             ["-q", "-n", verb, "-\(family)", dest, gateway]
@@ -49,9 +57,7 @@ enum NetworkSetup {
             let ip = stripPort(resolved)
             let family = ip.contains(":") ? "inet6" : "inet"
             guard family == "inet6" ? hasDefault6 : hasDefault4 else { continue }
-            // Without a gateway (connecting while offline) the pin is still recorded, so
-            // the network monitor installs it once a network shows up.
-            let gateway = gateways.gateway(family: family) ?? ""
+            let gateway = gateways.gateway(family: family) ?? HostRoute.offlineGateway(family: family)
             guard gateway != ip else { continue }
             hostRoutes.append(HostRoute(family: family, dest: ip, gateway: gateway))
         }
@@ -75,13 +81,15 @@ enum NetworkSetup {
     /// sends to the endpoint fail with EADDRNOTAVAIL ("can't assign requested address")
     /// and the whole tunnel is dead until it is re-pinned. That holds even when the new
     /// network uses the same gateway IP, so every call re-points every pin.
+    ///
+    /// Offline (no default gateway) the pin goes to loopback rather than being left
+    /// alone: IPConfiguration deletes routes using an address it removes, and with the
+    /// pin gone wireguard-go's own packets looped through the tunnel at ~75 MB/s.
     static func refreshHostRoutes(_ routes: [HostRoute]) -> [HostRoute] {
         let gateways = GatewayLookup()
         return routes.map { pin in
-            // Offline or mid-roam: keep whatever is installed. A stale pin can't carry
-            // traffic, but it keeps the endpoint out of the tunnel's own routes until a
-            // gateway appears and it can be re-pointed in place.
-            guard let gateway = gateways.gateway(family: pin.family), gateway != pin.dest else { return pin }
+            let gateway = gateways.gateway(family: pin.family) ?? HostRoute.offlineGateway(family: pin.family)
+            guard gateway != pin.dest else { return pin }
             let updated = HostRoute(family: pin.family, dest: pin.dest, gateway: gateway)
             return install(updated) ? updated : pin
         }

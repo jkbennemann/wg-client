@@ -46,6 +46,17 @@ final class NetworkMonitor {
         queue.async { self.scheduleReconcile() }
     }
 
+    /// "en0 192.168.2.181 via 192.168.2.1" for the primary IPv4 network; nil when offline.
+    static func primaryIPv4Summary() -> String? {
+        guard let store = SCDynamicStoreCreate(nil, "com.github.jkbennemann.wg-client" as CFString, nil, nil),
+              let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+              let service = global["PrimaryService"] as? String else { return nil }
+        let ipv4 = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv4" as CFString) as? [String: Any]
+        let iface = global["PrimaryInterface"] as? String ?? "?"
+        let address = (ipv4?["Addresses"] as? [String])?.first ?? "no address"
+        return "\(iface) \(address) via \(global["Router"] as? String ?? "no router")"
+    }
+
     /// A network transition arrives as a burst of store updates, and the kernel's
     /// default route can trail the store slightly — so act once the burst settles, then
     /// once more a little later. Must be called on `queue`.

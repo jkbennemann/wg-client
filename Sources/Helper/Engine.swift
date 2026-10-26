@@ -24,6 +24,8 @@ final class Engine {
 
     private let lock = NSLock()
     private var child: Process?
+    /// The network the last reconcile saw, so each change is logged once.
+    private var lastNetwork: String?
 
     /// Directory the helper binary lives in; wireguard-go is installed next to it.
     private lazy var helperDir: String = {
@@ -220,12 +222,16 @@ final class Engine {
         lock.lock(); defer { lock.unlock() }
         guard var state = activeState, kill(state.pid, 0) == 0 else { return }
 
+        // Logged on any change of the network itself, not just of the gateway: a new
+        // address behind the same router needs the re-pin just as much.
+        let network = NetworkMonitor.primaryIPv4Summary() ?? "no IPv4 network"
         let pins = NetworkSetup.refreshHostRoutes(state.hostRoutes)
-        if pins != state.hostRoutes {
-            let summary = pins.map { "\($0.dest) via \($0.gateway.isEmpty ? "(no gateway yet)" : $0.gateway)" }
-            log("Network changed: endpoint pinned to " + (summary.isEmpty ? "nothing" : summary.joined(separator: ", ")))
-            state.hostRoutes = pins
+        if network != lastNetwork || pins != state.hostRoutes {
+            let summary = pins.map { "\($0.dest) " + ($0.isOffline ? "to loopback (offline)" : "via \($0.gateway)") }
+            log("Network: \(network); endpoint pinned " + (summary.isEmpty ? "nowhere" : summary.joined(separator: ", ")))
+            lastNetwork = network
         }
+        state.hostRoutes = pins
 
         let dns = state.dns ?? (try? TunnelStore.read(name: state.name))
             .flatMap { try? TunnelConfig.parse($0) }?.interface.dns ?? []
