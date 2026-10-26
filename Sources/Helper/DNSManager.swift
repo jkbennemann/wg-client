@@ -6,14 +6,19 @@ import SystemConfiguration
 /// subprocesses — unlike `networksetup`, which spawns one process per service per
 /// operation and dominated connect/disconnect latency.
 ///
-/// We override the DNS key of the primary IPv4/IPv6 service(s) (where the default
-/// resolver's queries originate) and keep a serializable backup so the previous
-/// value can be restored — or the key removed — when the tunnel goes down.
+/// We overlay the `Setup:` DNS entity of the primary IPv4/IPv6 service(s) — the slot a
+/// manually configured DNS server occupies — which configd merges over the service's
+/// `State:` DNS (the DHCP / router-advertisement values). Overriding `State:` instead
+/// does not stick: IPConfiguration republishes it on every DHCP renewal and IPv6 RA,
+/// often within seconds. `Setup:` is only rewritten when configd re-applies the network
+/// preferences, which `apply` detects and re-asserts on the next network change. Nothing
+/// touches the persistent preferences, so a crash can't leave DNS behind past a reboot.
 enum DNSManager {
     struct Backup: Codable {
         struct Entry: Codable {
             var key: String
-            var priorPlist: Data?  // nil => key was absent; remove on restore
+            var priorPlist: Data?    // nil => key was absent; remove on restore
+            var appliedPlist: Data?  // what we last wrote, to tell it apart from configd's
         }
         var entries: [Entry]
     }
@@ -34,58 +39,97 @@ enum DNSManager {
     }
 
     /// Applies DNS from a list of `DNS =` values (IP addresses become servers,
-    /// everything else becomes a search domain). Returns nil if there were no
-    /// server addresses to set (we never blank out ServerAddresses).
+    /// everything else becomes a search domain) to the current primary service(s).
     ///
-    /// `preserving` carries the pre-VPN DNS backup forward across a make-before-break
-    /// handover: when non-nil, we overwrite the live DNS but return that original
-    /// backup unchanged, so a later teardown restores the true pre-VPN state rather
-    /// than the outgoing tunnel's (VPN) DNS values.
-    static func apply(_ dnsEntries: [String], preserving existing: Backup? = nil) throws -> Backup? {
+    /// Idempotent, so it is safe to call on every network change: services that already
+    /// carry our value are left alone. `backup` is threaded through every call — and
+    /// across a make-before-break handover — so a teardown restores the true pre-VPN
+    /// value rather than an outgoing tunnel's. Returns the backup to persist and the
+    /// keys written by this call. With no server addresses or no primary service
+    /// (offline, mid-roam), nothing is touched.
+    static func apply(_ dnsEntries: [String], backup: Backup?) throws -> (backup: Backup?, written: [String]) {
         let servers = dnsEntries.filter(isIPAddress)
         let search = dnsEntries.filter { !isIPAddress($0) }
-        guard !servers.isEmpty else { return existing }
+        guard !servers.isEmpty else { return (backup, []) }
 
         guard let store = makeStore() else {
             throw HelperError("Unable to open the SystemConfiguration dynamic store")
         }
         let ids = primaryServiceIDs(store)
-        guard !ids.isEmpty else {
-            log("No primary network service; skipping DNS configuration")
-            return existing ?? Backup(entries: [])
-        }
+        guard !ids.isEmpty else { return (backup, []) }
 
         var dns: [String: Any] = ["ServerAddresses": servers]
         if !search.isEmpty {
             dns["SearchDomains"] = search
             dns["DomainName"] = search.first
         }
+        let desired = dns as NSDictionary
 
-        var entries: [Backup.Entry] = []
-        for id in ids {
-            let key = "State:/Network/Service/\(id)/DNS"
-            if existing == nil {
-                let prior = SCDynamicStoreCopyValue(store, key as CFString)
-                let priorData = prior.flatMap {
-                    try? PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0)
-                }
-                entries.append(Backup.Entry(key: key, priorPlist: priorData))
+        // Entries left by helpers that overrode State: keys are dropped: IPConfiguration
+        // republishes those keys by itself, and writing an old snapshot back would
+        // reinstate stale DNS. Only a key still holding the tunnel's value is put back.
+        for legacy in backup?.entries ?? [] where legacy.key.hasPrefix("State:") {
+            if isEqual(SCDynamicStoreCopyValue(store, legacy.key as CFString), desired) {
+                putBack(legacy, store)
             }
-            SCDynamicStoreSetValue(store, key as CFString, dns as CFDictionary)
         }
-        return existing ?? Backup(entries: entries)
+        var entries = (backup?.entries ?? []).filter { $0.key.hasPrefix("Setup:") }
+        var written: [String] = []
+        for id in ids {
+            let key = "Setup:/Network/Service/\(id)/DNS"
+            let current = SCDynamicStoreCopyValue(store, key as CFString)
+            if let index = entries.firstIndex(where: { $0.key == key }) {
+                // Anything other than our own value was put there by configd re-applying
+                // the network preferences: that is now the value to restore on teardown.
+                let ours = isEqual(current, decode(entries[index].appliedPlist)) || isEqual(current, desired)
+                if !ours { entries[index].priorPlist = encode(current) }
+                entries[index].appliedPlist = encode(desired)
+            } else {
+                entries.append(Backup.Entry(key: key, priorPlist: encode(current), appliedPlist: encode(desired)))
+            }
+            if !isEqual(current, desired) {
+                SCDynamicStoreSetValue(store, key as CFString, desired)
+                written.append(key)
+            }
+        }
+        return (Backup(entries: entries), written)
     }
 
+    /// Puts back each overlaid key's pre-VPN value. A key that no longer holds what we
+    /// wrote has been re-applied by configd since, so it is already correct and left alone.
     static func restore(_ backup: Backup) {
         guard let store = makeStore() else { return }
-        for entry in backup.entries {
-            let key = entry.key as CFString
-            if let data = entry.priorPlist,
-               let obj = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) {
-                SCDynamicStoreSetValue(store, key, obj as CFPropertyList)
-            } else {
-                SCDynamicStoreRemoveValue(store, key)
+        for entry in backup.entries where entry.key.hasPrefix("Setup:") {
+            if entry.appliedPlist != nil,
+               !isEqual(SCDynamicStoreCopyValue(store, entry.key as CFString), decode(entry.appliedPlist)) {
+                continue
             }
+            putBack(entry, store)
+        }
+    }
+
+    private static func putBack(_ entry: Backup.Entry, _ store: SCDynamicStore) {
+        let key = entry.key as CFString
+        if let prior = decode(entry.priorPlist) {
+            SCDynamicStoreSetValue(store, key, prior)
+        } else {
+            SCDynamicStoreRemoveValue(store, key)
+        }
+    }
+
+    private static func encode(_ value: CFPropertyList?) -> Data? {
+        value.flatMap { try? PropertyListSerialization.data(fromPropertyList: $0, format: .binary, options: 0) }
+    }
+
+    private static func decode(_ data: Data?) -> CFPropertyList? {
+        data.flatMap { try? PropertyListSerialization.propertyList(from: $0, options: [], format: nil) as CFPropertyList }
+    }
+
+    private static func isEqual(_ a: CFPropertyList?, _ b: CFPropertyList?) -> Bool {
+        switch (a, b) {
+        case (nil, nil): return true
+        case let (a?, b?): return CFEqual(a, b)
+        default: return false
         }
     }
 

@@ -13,6 +13,10 @@ guard geteuid() == 0 else {
     exit(1)
 }
 
+// Before this run logs anything, so no startup line can land between the trim's read
+// and its truncate; later trims run on a timer.
+trimLog()
+
 let engine = Engine()
 
 do {
@@ -25,6 +29,15 @@ do {
 
 engine.reconcileOnStartup()
 
+// Keeps the active tunnel's endpoint pin and DNS following the physical network.
+let networkMonitor = NetworkMonitor { engine.reconcileNetwork() }
+networkMonitor.start()
+
+let logTrimTimer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "log-trim"))
+logTrimTimer.schedule(deadline: .now() + .seconds(15 * 60), repeating: .seconds(15 * 60))
+logTrimTimer.setEventHandler { trimLog() }
+logTrimTimer.resume()
+
 /// Returns the tail of the helper's log file (the daemon's own StandardOutPath).
 /// Reading it here — as root — avoids any permission ambiguity on the client side.
 func readLogTail(maxBytes: UInt64 = 256 * 1024) -> String {
@@ -33,8 +46,31 @@ func readLogTail(maxBytes: UInt64 = 256 * 1024) -> String {
     let end = (try? handle.seekToEnd()) ?? 0
     let start = end > maxBytes ? end - maxBytes : 0
     try? handle.seek(toOffset: start)
-    let data = (try? handle.readToEnd()) ?? Data()
-    return String(data: data, encoding: .utf8) ?? ""
+    var data = (try? handle.readToEnd()) ?? Data()
+    // A tail cut at an arbitrary byte starts mid-line, often mid-character (the log is
+    // full of "…" and "↳"); strict UTF-8 decoding then failed and the viewer showed an
+    // empty log. Start at the first complete line and decode leniently.
+    if start > 0, let newline = data.firstIndex(of: 0x0A) {
+        data = data[data.index(after: newline)...]
+    }
+    return String(decoding: data, as: UTF8.self)
+}
+
+/// launchd appends the helper's (and wireguard-go's) output to the log file forever.
+/// Once it passes `limit`, keep only the newest `keep` bytes. Every writer has the file
+/// open with O_APPEND, so truncating in place is safe: their next line lands at the new end.
+func trimLog(limit: UInt64 = 4 * 1024 * 1024, keep: UInt64 = 1024 * 1024) {
+    guard let handle = FileHandle(forUpdatingAtPath: IPC.logPath) else { return }
+    defer { try? handle.close() }
+    guard let size = try? handle.seekToEnd(), size > limit else { return }
+    try? handle.seek(toOffset: size - keep)
+    var kept = (try? handle.readToEnd()) ?? Data()
+    if let newline = kept.firstIndex(of: 0x0A) {
+        kept = kept[kept.index(after: newline)...]
+    }
+    try? handle.truncate(atOffset: 0)
+    try? handle.write(contentsOf: kept)
+    log("Trimmed log from \(size / 1024) KiB to the newest \(kept.count / 1024) KiB")
 }
 
 func peerAllowed(_ fd: Int32) -> Bool {

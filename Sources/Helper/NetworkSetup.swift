@@ -4,10 +4,16 @@ import Shared
 /// ifconfig / route plumbing — the parts wg-quick(8) would normally do on darwin.
 /// DNS is handled separately by `DNSManager` (via the SystemConfiguration store).
 enum NetworkSetup {
-    struct HostRoute: Codable {
+    struct HostRoute: Codable, Equatable {
         var family: String  // "inet" | "inet6"
         var dest: String
+        /// Physical gateway the endpoint is pinned to; empty while there is none
+        /// (offline), in which case nothing is installed until the network returns.
         var gateway: String
+
+        fileprivate func args(_ verb: String) -> [String] {
+            ["-q", "-n", verb, "-\(family)", dest, gateway]
+        }
     }
 
     // MARK: - Interface
@@ -36,26 +42,102 @@ enum NetworkSetup {
         let hasDefault6 = networks.contains("::/0")
         guard hasDefault4 || hasDefault6 else { return [] }
 
+        let gateways = GatewayLookup()
         var hostRoutes: [HostRoute] = []
         for index in config.peers.indices {
             guard let resolved = resolvedEndpoints[index] else { continue }
             let ip = stripPort(resolved)
-            let isV6 = ip.contains(":")
-            guard isV6 ? hasDefault6 : hasDefault4 else { continue }
-            guard let gateway = defaultGateway(v6: isV6), gateway != ip else { continue }
-            hostRoutes.append(HostRoute(family: isV6 ? "inet6" : "inet", dest: ip, gateway: gateway))
+            let family = ip.contains(":") ? "inet6" : "inet"
+            guard family == "inet6" ? hasDefault6 : hasDefault4 else { continue }
+            // Without a gateway (connecting while offline) the pin is still recorded, so
+            // the network monitor installs it once a network shows up.
+            let gateway = gateways.gateway(family: family) ?? ""
+            guard gateway != ip else { continue }
+            hostRoutes.append(HostRoute(family: family, dest: ip, gateway: gateway))
         }
         return hostRoutes
     }
 
     static func installHostRoutes(_ routes: [HostRoute]) {
-        let commands = routes.map { ["-q", "-n", "add", "-\($0.family)", $0.dest, $0.gateway] }
+        Shell.runParallelForEach(routes.filter { !$0.gateway.isEmpty }) { _ = install($0) }
+    }
+
+    /// Deletes by destination only: the kernel matches host routes on the destination,
+    /// and the gateway recorded at pin time may no longer be the one installed.
+    static func removeHostRoutes(_ routes: [HostRoute]) {
+        let commands = routes.map { ["-q", "-n", "delete", "-\($0.family)", $0.dest] }
         Shell.runParallel("/sbin/route", commands)
     }
 
-    static func removeHostRoutes(_ routes: [HostRoute]) {
-        let commands = routes.map { ["-q", "-n", "delete", "-\($0.family)", $0.dest, $0.gateway] }
-        Shell.runParallel("/sbin/route", commands)
+    /// Re-points the endpoint pins at the *current* physical network and returns them
+    /// as now installed. A pin is a static route bound to the gateway and source address
+    /// that existed when it was added: after a Wi-Fi roam or a wake on another network,
+    /// sends to the endpoint fail with EADDRNOTAVAIL ("can't assign requested address")
+    /// and the whole tunnel is dead until it is re-pinned. That holds even when the new
+    /// network uses the same gateway IP, so every call re-points every pin.
+    static func refreshHostRoutes(_ routes: [HostRoute]) -> [HostRoute] {
+        let gateways = GatewayLookup()
+        return routes.map { pin in
+            // Offline or mid-roam: keep whatever is installed. A stale pin can't carry
+            // traffic, but it keeps the endpoint out of the tunnel's own routes until a
+            // gateway appears and it can be re-pointed in place.
+            guard let gateway = gateways.gateway(family: pin.family), gateway != pin.dest else { return pin }
+            let updated = HostRoute(family: pin.family, dest: pin.dest, gateway: gateway)
+            return install(updated) ? updated : pin
+        }
+    }
+
+    /// Installs or re-points one pin in place; returns whether the kernel accepted it.
+    private static func install(_ pin: HostRoute) -> Bool {
+        switch exactHostRouteFlags(family: pin.family, dest: pin.dest) {
+        case let flags? where flags.contains("STATIC") && !flags.contains("WASCLONED"):
+            // Only ever `route change` a pin that is really there: for a host route that
+            // doesn't exist, the kernel re-points whichever route best matches the
+            // destination instead — the tunnel's own /1 route.
+            return route(pin.args("change"))
+        case .some:
+            // A host route the kernel cloned from another route as a cache entry.
+            route(["-q", "-n", "delete", "-\(pin.family)", pin.dest])
+            return route(pin.args("add"))
+        case nil:
+            return route(pin.args("add"))
+        }
+    }
+
+    /// The flags of the host route for exactly `dest`, or nil if lookups for it only
+    /// match a covering network route.
+    private static func exactHostRouteFlags(family: String, dest: String) -> String? {
+        guard let result = try? Shell.run("/sbin/route", ["-n", "get", "-\(family)", dest]),
+              result.status == 0 else { return nil }
+        var destination: String?
+        var flags = ""
+        for line in result.stdout.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("destination:") {
+                destination = trimmed.dropFirst("destination:".count).trimmingCharacters(in: .whitespaces)
+            } else if trimmed.hasPrefix("flags:") {
+                flags = trimmed
+            }
+        }
+        guard destination == dest, flags.contains("HOST") else { return nil }
+        return flags
+    }
+
+    @discardableResult
+    private static func route(_ args: [String]) -> Bool {
+        (try? Shell.run("/sbin/route", args))?.status == 0
+    }
+
+    /// Looks up each family's default gateway at most once per pin computation.
+    private final class GatewayLookup {
+        private var cache: [String: String?] = [:]
+
+        func gateway(family: String) -> String? {
+            if let cached = cache[family] { return cached }
+            let gateway = NetworkSetup.defaultGateway(v6: family == "inet6")
+            cache.updateValue(gateway, forKey: family)
+            return gateway
+        }
     }
 
     /// The interface-scoped routes for all AllowedIPs (the /1 split for full-tunnel

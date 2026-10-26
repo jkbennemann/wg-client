@@ -13,6 +13,9 @@ final class Engine {
         var networks: [String]
         var hostRoutes: [NetworkSetup.HostRoute]
         var dnsBackup: DNSManager.Backup?
+        /// The tunnel's `DNS =` entries, re-applied after network changes. nil in state
+        /// written by older helpers; read back from the stored config then.
+        var dns: [String]?
     }
 
     static let stateDir = "/var/run/wg-client"
@@ -82,7 +85,8 @@ final class Engine {
             lastStamp = phase("cut routes over to \(iface)", since: lastStamp)
 
             if !config.interface.dns.isEmpty {
-                dnsBackup = ((try? DNSManager.apply(config.interface.dns, preserving: current.dnsBackup)) ?? current.dnsBackup)
+                dnsBackup = (try? DNSManager.apply(config.interface.dns, backup: current.dnsBackup))?.backup
+                    ?? current.dnsBackup
             } else if let originalDNS = current.dnsBackup {
                 DNSManager.restore(originalDNS)  // new tunnel has no DNS → revert to pre-VPN
             }
@@ -102,7 +106,7 @@ final class Engine {
             lastStamp = phase("add routes", since: lastStamp)
             if !config.interface.dns.isEmpty {
                 do {
-                    dnsBackup = try DNSManager.apply(config.interface.dns)
+                    dnsBackup = try DNSManager.apply(config.interface.dns, backup: nil).backup
                 } catch {
                     log("Warning: could not set DNS: \(error.localizedDescription)")
                 }
@@ -116,14 +120,10 @@ final class Engine {
             iface: iface,
             networks: config.peers.flatMap { $0.allowedIPs }.map(UAPI.normalizeCIDR),
             hostRoutes: pins,
-            dnsBackup: dnsBackup
+            dnsBackup: dnsBackup,
+            dns: config.interface.dns
         )
-        if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: URL(fileURLWithPath: Self.statePath), options: .atomic)
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statePath)
-        } else {
-            log("Warning: could not persist active-tunnel state")
-        }
+        save(state)
         child = process
         _ = phase("total activation", since: overallStart)
         log("Tunnel \(name) is up on \(iface)")
@@ -210,9 +210,47 @@ final class Engine {
         lock.lock(); defer { lock.unlock() }
         guard var state = activeState, state.name == old else { return }
         state.name = new
-        if let data = try? JSONEncoder().encode(state) {
-            try? data.write(to: URL(fileURLWithPath: Self.statePath), options: .atomic)
+        save(state)
+    }
+
+    /// Re-asserts the active tunnel's endpoint pins and DNS against the network the Mac
+    /// is on *now*. Called by `NetworkMonitor` after Wi-Fi roams, sleep/wake, and DHCP or
+    /// preference changes; cheap and idempotent, so spurious calls are harmless.
+    func reconcileNetwork() {
+        lock.lock(); defer { lock.unlock() }
+        guard var state = activeState, kill(state.pid, 0) == 0 else { return }
+
+        let pins = NetworkSetup.refreshHostRoutes(state.hostRoutes)
+        if pins != state.hostRoutes {
+            let summary = pins.map { "\($0.dest) via \($0.gateway.isEmpty ? "(no gateway yet)" : $0.gateway)" }
+            log("Network changed: endpoint pinned to " + (summary.isEmpty ? "nothing" : summary.joined(separator: ", ")))
+            state.hostRoutes = pins
         }
+
+        let dns = state.dns ?? (try? TunnelStore.read(name: state.name))
+            .flatMap { try? TunnelConfig.parse($0) }?.interface.dns ?? []
+        state.dns = dns
+        if !dns.isEmpty {
+            do {
+                let (backup, written) = try DNSManager.apply(dns, backup: state.dnsBackup)
+                state.dnsBackup = backup
+                if !written.isEmpty {
+                    log("Network changed: re-applied tunnel DNS to " + written.joined(separator: ", "))
+                }
+            } catch {
+                log("Warning: could not re-apply DNS: \(error.localizedDescription)")
+            }
+        }
+        save(state)
+    }
+
+    private func save(_ state: ActiveState) {
+        guard let data = try? JSONEncoder().encode(state) else {
+            log("Warning: could not persist active-tunnel state")
+            return
+        }
+        try? data.write(to: URL(fileURLWithPath: Self.statePath), options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.statePath)
     }
 
     /// Logs how long a phase took and returns a fresh timestamp to chain from.

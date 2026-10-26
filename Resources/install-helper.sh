@@ -13,8 +13,13 @@ DEST="/Library/PrivilegedHelperTools/WGClient"
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 
 mkdir -p "$DEST"
-cp -f "$HELPER" "$DEST/wireguard-client-helper"
-cp -f "$WGGO" "$DEST/wireguard-go"
+# Replace binaries by rename, never in place: an active tunnel's wireguard-go keeps
+# running across a helper upgrade, and rewriting its executable under it can get it
+# killed for an invalid code signature. A rename leaves the running inode untouched.
+cp -f "$HELPER" "$DEST/wireguard-client-helper.new"
+cp -f "$WGGO" "$DEST/wireguard-go.new"
+mv -f "$DEST/wireguard-client-helper.new" "$DEST/wireguard-client-helper"
+mv -f "$DEST/wireguard-go.new" "$DEST/wireguard-go"
 chown -R root:wheel "$DEST"
 chmod 755 "$DEST" "$DEST/wireguard-client-helper" "$DEST/wireguard-go"
 

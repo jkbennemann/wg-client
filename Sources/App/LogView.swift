@@ -30,19 +30,7 @@ struct LogView: View {
 
             Divider()
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(displayText)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .id("logEnd")
-                }
-                .onChange(of: text) { _ in
-                    proxy.scrollTo("logEnd", anchor: .bottom)
-                }
-            }
+            LogTextView(text: displayText)
         }
         .frame(minWidth: 640, minHeight: 420)
         .onAppear(perform: load)
@@ -74,5 +62,28 @@ struct LogView: View {
                 }
             }
         }
+    }
+}
+
+/// Read-only, selectable log text scrolled to the end. Backed by NSTextView because a
+/// SwiftUI `Text` lays out its whole string on the main thread: the 256 KiB tail the
+/// helper sends froze the window for ~5 s on every open, refresh, and resize.
+private struct LogTextView: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSTextView.scrollableTextView()
+        let textView = scrollView.documentView as! NSTextView
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        textView.textContainerInset = NSSize(width: 6, height: 6)
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        guard let textView = scrollView.documentView as? NSTextView, textView.string != text else { return }
+        textView.string = text
+        textView.scrollToEndOfDocument(nil)
     }
 }

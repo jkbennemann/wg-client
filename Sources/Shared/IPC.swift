@@ -7,7 +7,7 @@ public enum IPC {
     /// Bumped whenever the helper binary's behavior changes without a wire-protocol
     /// break. The app compares the running helper's reported build against its own
     /// and offers to reinstall on a mismatch, so rebuilds actually take effect.
-    public static let build = "0.0.1"
+    public static let build = "0.0.2"
 }
 
 public struct IPCRequest: Codable {
