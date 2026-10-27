@@ -46,6 +46,23 @@ final class NetworkMonitor {
         queue.async { self.scheduleReconcile() }
     }
 
+    /// Tells apps watching the global network keys that the network changed. The tunnel is
+    /// not a configd service; configd republishes those keys only as a side effect of the
+    /// DNS overlay changing, so switching between tunnels (or a tunnel without DNS) goes
+    /// unnoticed, and Chromium-based apps (browsers, Electron) keep pooled connections
+    /// bound to an address that is gone. A notification on the unchanged keys makes
+    /// Chromium re-check its interface list, which the tunnel address did change, so it
+    /// closes its HTTP/2 sessions and idle sockets with ERR_NETWORK_CHANGED. WebSockets
+    /// and other long-lived connections are not covered.
+    static func announceChange() {
+        guard let store = SCDynamicStoreCreate(nil, "com.github.jkbennemann.wg-client" as CFString, nil, nil) else {
+            return
+        }
+        for entity in [kSCEntNetIPv4, kSCEntNetIPv6] {
+            SCDynamicStoreNotifyValue(store, SCDynamicStoreKeyCreateNetworkGlobalEntity(nil, kSCDynamicStoreDomainState, entity))
+        }
+    }
+
     /// "en0 192.168.2.181 via 192.168.2.1" for the primary IPv4 network; nil when offline.
     static func primaryIPv4Summary() -> String? {
         guard let store = SCDynamicStoreCreate(nil, "com.github.jkbennemann.wg-client" as CFString, nil, nil),

@@ -127,6 +127,9 @@ final class Engine {
         )
         save(state)
         child = process
+        // Connections opened before this (direct, or through the previous tunnel) can't
+        // carry traffic anymore; let apps that listen for network changes drop them.
+        NetworkMonitor.announceChange()
         _ = phase("total activation", since: overallStart)
         log("Tunnel \(name) is up on \(iface)")
     }
@@ -273,6 +276,7 @@ final class Engine {
             throw HelperError("No tunnel is active")
         }
         cleanup(state, killProcess: true)
+        NetworkMonitor.announceChange()
         log("Tunnel \(state.name) is down")
     }
 
