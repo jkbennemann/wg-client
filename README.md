@@ -85,28 +85,28 @@ Release, installed via a Homebrew Cask hosted in a separate tap repo.
       --apple-id you@example.com --team-id TEAMID --password <app-specific-password>
   ```
 
-**Cutting a release locally**
+**Cutting a release**
 
-```sh
-export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-export NOTARY_PROFILE="wg-client-notary"
-scripts/package-release.sh 0.0.1
-```
+Releases are cut locally; there is no CI release pipeline (it would need the
+Developer ID key, Apple credentials and a tap token stored as repo secrets).
 
-This builds, signs with a hardened runtime + secure timestamp, notarizes, staples,
-and zips the app, then prints the `version` and `sha256` for the cask. Then:
-
-```sh
-gh release create v0.0.1 "dist/WG-Client-0.0.1.zip" --title v0.0.1 --generate-notes
-# update version + sha256 in the tap's Casks/wg-client.rb and push
-```
-
-**Or via CI:** push a `vX.Y.Z` tag and `.github/workflows/release.yml` does all of
-the above on a macOS runner, then commits the updated cask to the tap. It needs
-these repo secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`,
-`MACOS_KEYCHAIN_PASSWORD`, `MACOS_CODESIGN_IDENTITY`, `NOTARY_APPLE_ID`,
-`NOTARY_TEAM_ID`, `NOTARY_PASSWORD`, and `TAP_PUSH_TOKEN` (a PAT with write access
-to the tap repo).
+1. Bump `CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist`
+   and `IPC.build` in `Sources/Shared/IPC.swift` (see below), commit.
+2. Build, sign, notarize, staple and zip:
+   ```sh
+   export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+   export NOTARY_PROFILE="wg-client-notary"
+   scripts/package-release.sh 0.0.3
+   ```
+   It prints the `version` and `sha256` for the cask.
+3. Put them into this repo's `Casks/wg-client.rb`, commit and push `main`.
+4. Publish the zip:
+   ```sh
+   gh release create v0.0.3 "dist/WG-Client-0.0.3.zip" --target main --title v0.0.3 --notes-file notes.md
+   ```
+5. Copy the **whole** `Casks/wg-client.rb` into the tap repo and push. The tap's
+   cask must match this repo's file, not just its version and checksum: stanzas
+   such as `uninstall` change with the app.
 
 Bump `CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist` and
 `IPC.build` in `Sources/Shared/IPC.swift` to match each release (the build script
