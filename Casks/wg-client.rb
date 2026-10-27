@@ -23,7 +23,15 @@ cask "wg-client" do
   # daemon, and removes its privileged files. The launchctl/delete steps touch
   # /Library, so Homebrew prompts once for admin rights. Tunnel configs live in
   # Application Support and are preserved here — only `--zap` removes them.
-  uninstall launchctl: "com.github.jkbennemann.wg-client.helper",
+  # A tunnel can outlive the helper (wireguard-go runs on its own); its pf rules
+  # would then block the physical network with nothing left to remove them.
+  uninstall early_script: {
+              executable:   "/sbin/pfctl",
+              args:         ["-a", "com.apple/wg-client", "-F", "rules"],
+              sudo:         true,
+              must_succeed: false,
+            },
+            launchctl: "com.github.jkbennemann.wg-client.helper",
             quit:      "com.github.jkbennemann.wg-client",
             delete:    [
               "/Library/LaunchDaemons/com.github.jkbennemann.wg-client.helper.plist",

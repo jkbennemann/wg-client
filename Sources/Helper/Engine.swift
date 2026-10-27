@@ -70,6 +70,13 @@ final class Engine {
         } else {
             log("Adopted running tunnel \(state.name) on \(state.iface) (pid \(state.pid))")
             watchForExit(pid: state.pid)
+            // Whatever replaced the helper may have flushed the pf anchor (the Homebrew cask's
+            // uninstall does): have the first reconcile load the rules again.
+            var adopted = state
+            if adopted.bypass?.pfRules != nil {
+                adopted.bypass?.pfRules = nil
+                save(adopted)
+            }
         }
     }
 
