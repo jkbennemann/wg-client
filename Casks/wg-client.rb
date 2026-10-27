@@ -2,8 +2,7 @@ cask "wg-client" do
   version "0.0.3"
   sha256 "994b43ed73dfaa489592b2e40c08570129a1c5939e578906926b73aacf9d5757"
 
-  url "https://github.com/jkbennemann/wg-client/releases/download/v#{version}/WG-Client-#{version}.zip",
-      verified: "github.com/jkbennemann/wg-client/"
+  url "https://github.com/jkbennemann/wg-client/releases/download/v#{version}/WG-Client-#{version}.zip"
   name "WG Client"
   desc "Menu-bar WireGuard client with multi-tunnel support"
   homepage "https://github.com/jkbennemann/wg-client"
