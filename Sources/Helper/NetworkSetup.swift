@@ -24,6 +24,112 @@ enum NetworkSetup {
         }
     }
 
+    /// A default route scoped to the physical interface (`route add -ifscope en0 default
+    /// <gw>`), kept while a full tunnel is up.
+    ///
+    /// Connections opened before the tunnel came up keep their physical source address,
+    /// and XNU sends a TCP packet through the interface owning its source address, with a
+    /// route lookup scoped to that interface. The physical interface stays the system's
+    /// primary one here (the tunnel isn't a configd service), and the primary interface has
+    /// no scoped default of its own; the lookup's fallback to "the default route" is a
+    /// longest-prefix match on 0.0.0.0, which now finds the tunnel's 0.0.0.0/1 on the wrong
+    /// interface. So every packet is dropped as unroutable before reaching any interface or
+    /// pf, and TCP retries silently until the app gives up: 20–30 s of hanging in browsers
+    /// and chat apps after connecting. With the scoped default those packets reach the
+    /// physical interface again, where `PacketFilter` either rejects them or (setting off)
+    /// lets them finish outside the tunnel. New connections still pick the tunnel.
+    ///
+    /// configd maintains scoped defaults for every non-primary interface itself, so only
+    /// the primary interface's one is ever added or removed here.
+    struct ScopedDefault: Codable, Equatable {
+        var family: String  // "inet" | "inet6"
+        var iface: String
+        var gateway: String
+
+        fileprivate var deleteArgs: [String] {
+            ["-q", "-n", "delete", "-\(family)", "-ifscope", iface, "default"]
+        }
+
+        fileprivate var addArgs: [String] {
+            ["-n", "add", "-\(family)", "-ifscope", iface, "default", gateway]
+        }
+    }
+
+    /// The subnets directly attached to `iface` ("192.168.2.0/24", "2003:e5:d745:4c61::/64"),
+    /// link-local ones excepted.
+    static func attachedNetworks(iface: String) -> [String] {
+        var head: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&head) == 0, let head else { return [] }
+        defer { freeifaddrs(head) }
+        var networks: [String] = []
+        for entry in sequence(first: head, next: { $0.pointee.ifa_next }) {
+            let ifa = entry.pointee
+            guard String(cString: ifa.ifa_name) == iface, let addr = ifa.ifa_addr, let mask = ifa.ifa_netmask else { continue }
+            let family = Int32(addr.pointee.sa_family)
+            let length = family == AF_INET ? 4 : family == AF_INET6 ? 16 : 0
+            let offset = family == AF_INET ? 4 : 8  // sin_addr / sin6_addr within the sockaddr
+            guard length > 0 else { continue }
+            var bytes = [UInt8](repeating: 0, count: length)
+            var prefix = 0
+            let addrBytes = UnsafeRawPointer(addr).advanced(by: offset)
+            let maskBytes = UnsafeRawPointer(mask).advanced(by: offset)
+            for i in 0..<length {
+                let m = maskBytes.load(fromByteOffset: i, as: UInt8.self)
+                bytes[i] = addrBytes.load(fromByteOffset: i, as: UInt8.self) & m
+                prefix += m.nonzeroBitCount
+            }
+            if family == AF_INET6, bytes[0] == 0xfe, bytes[1] & 0xc0 == 0x80 { continue }
+            var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+            guard inet_ntop(family, bytes, &text, socklen_t(text.count)) != nil else { continue }
+            let network = "\(String(cString: text))/\(prefix)"
+            if !networks.contains(network) { networks.append(network) }
+        }
+        return networks
+    }
+
+    /// "inet" / "inet6" for each family whose default route the tunnel takes over.
+    static func fullTunnelFamilies(networks: [String]) -> Set<String> {
+        var families = Set<String>()
+        if networks.contains("0.0.0.0/0") { families.insert("inet") }
+        if networks.contains("::/0") { families.insert("inet6") }
+        return families
+    }
+
+    /// The physical default route of each family, as the scoped default it calls for.
+    static func physicalDefaults(families: Set<String>) -> [ScopedDefault] {
+        ["inet", "inet6"].filter(families.contains).compactMap { family in
+            guard let route = defaultRoute(v6: family == "inet6"), let iface = route.iface,
+                  !iface.hasPrefix("utun") else { return nil }
+            return ScopedDefault(family: family, iface: iface, gateway: route.gateway)
+        }
+    }
+
+    /// Brings the scoped defaults this helper owns in line with `desired` and returns the
+    /// ones it owns afterwards. Deleting is exact (`-ifscope` is part of the route's key,
+    /// so the unscoped default can never match), but a scoped default is only deleted while
+    /// its interface is still the primary one: once another interface took over, configd
+    /// maintains this one.
+    static func refreshScopedDefaults(_ owned: [ScopedDefault], desired: [ScopedDefault]) -> [ScopedDefault] {
+        var result: [ScopedDefault] = []
+        for family in ["inet", "inet6"] {
+            let mine = owned.first { $0.family == family }
+            let wanted = desired.first { $0.family == family }
+            if let mine, mine != wanted, wanted == nil || wanted?.iface == mine.iface {
+                route(mine.deleteArgs)
+            }
+            guard let wanted else { continue }
+            // Re-added on every pass: IPConfiguration flushes routes along with the
+            // addresses they use, and "File exists" is the cheap common case.
+            guard let added = try? Shell.run("/sbin/route", wanted.addArgs) else { continue }
+            let exists = (added.stdout + added.stderr).contains("File exists")
+            if added.status == 0 || (exists && mine == wanted) {
+                result.append(wanted)
+            }
+            // "File exists" for a route this helper didn't add: someone else's, left alone.
+        }
+        return result
+    }
+
     // MARK: - Interface
 
     static func configureInterface(iface: String, config: TunnelConfig) throws {
@@ -142,7 +248,7 @@ enum NetworkSetup {
 
         func gateway(family: String) -> String? {
             if let cached = cache[family] { return cached }
-            let gateway = NetworkSetup.defaultGateway(v6: family == "inet6")
+            let gateway = NetworkSetup.defaultRoute(v6: family == "inet6")?.gateway
             cache.updateValue(gateway, forKey: family)
             return gateway
         }
@@ -204,16 +310,21 @@ enum NetworkSetup {
         return resolvedEndpoint
     }
 
-    private static func defaultGateway(v6: Bool) -> String? {
+    /// The physical default route's gateway and interface; nil without a gateway.
+    private static func defaultRoute(v6: Bool) -> (gateway: String, iface: String?)? {
         let args = v6 ? ["-n", "get", "-inet6", "default"] : ["-n", "get", "default"]
         guard let result = try? Shell.run("/sbin/route", args), result.status == 0 else { return nil }
+        var gateway: String?
+        var iface: String?
         for line in result.stdout.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("gateway:") {
-                let gw = trimmed.dropFirst("gateway:".count).trimmingCharacters(in: .whitespaces)
-                return gw.isEmpty ? nil : gw
+                gateway = trimmed.dropFirst("gateway:".count).trimmingCharacters(in: .whitespaces)
+            } else if trimmed.hasPrefix("interface:") {
+                iface = trimmed.dropFirst("interface:".count).trimmingCharacters(in: .whitespaces)
             }
         }
-        return nil
+        guard let gateway, !gateway.isEmpty else { return nil }
+        return (gateway, iface)
     }
 }

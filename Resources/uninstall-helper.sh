@@ -7,6 +7,9 @@ set -eu
 LABEL="com.github.jkbennemann.wg-client.helper"
 
 launchctl bootout "system/$LABEL" 2>/dev/null || true
+# Firewall rules a tunnel may have left: they would keep blocking the physical network.
+pfctl -a com.apple/wg-client -F rules 2>/dev/null || true
+pfctl -a com.apple/wg-client -F Tables 2>/dev/null || true
 rm -f "/Library/LaunchDaemons/$LABEL.plist"
 rm -rf "/Library/PrivilegedHelperTools/WGClient"
 rm -f /var/run/wg-client.sock

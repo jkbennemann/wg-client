@@ -72,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .ok:
             addStatusSection(to: menu)
             addTunnelSection(to: menu)
+            addSettingsSection(to: menu)
         case .notInstalled, .unknown:
             menu.addItem(disabledItem("Helper Not Installed"))
             menu.addItem(actionItem("Install Helper…", #selector(installHelper)))
@@ -126,6 +127,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
     }
 
+    private func addSettingsSection(to menu: NSMenu) {
+        let item = actionItem("Block Traffic Outside the Tunnel", #selector(toggleBlockOutsideTunnel))
+        item.state = state.blockOutsideTunnel ? .on : .off
+        item.toolTip = "Applies while a tunnel carries all traffic. On: connections opened before "
+            + "connecting are cut, and apps reconnect through the tunnel right away. Off: they keep "
+            + "running outside the tunnel until they close."
+        menu.addItem(item)
+        menu.addItem(.separator())
+    }
+
     private func disabledItem(_ title: String) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
@@ -155,6 +166,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func deactivate() {
         controller.deactivate()
+    }
+
+    @objc private func toggleBlockOutsideTunnel() {
+        controller.setBlockOutsideTunnel(!state.blockOutsideTunnel)
     }
 
     @objc func openManageWindow() {

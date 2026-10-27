@@ -89,13 +89,15 @@ func dispatch(_ request: IPCRequest) -> IPCResponse {
         case "hello":
             return IPCResponse(ok: true, version: IPC.protocolVersion, build: IPC.build,
                                activeTunnel: engine.activeName,
-                               activeNetworks: engine.activeNetworks)
+                               activeNetworks: engine.activeNetworks,
+                               blockOutsideTunnel: HelperSettings.blockOutsideTunnel)
 
         case "list":
             let active = engine.activeName
             let tunnels = TunnelStore.list().map { TunnelInfo(name: $0, isActive: $0 == active) }
             return IPCResponse(ok: true, activeTunnel: active,
-                               activeNetworks: engine.activeNetworks, tunnels: tunnels)
+                               activeNetworks: engine.activeNetworks, tunnels: tunnels,
+                               blockOutsideTunnel: HelperSettings.blockOutsideTunnel)
 
         case "import":
             guard let name = request.name, let config = request.config else {
@@ -153,6 +155,13 @@ func dispatch(_ request: IPCRequest) -> IPCResponse {
 
         case "log":
             return IPCResponse(ok: true, log: readLogTail())
+
+        case "setBlockOutsideTunnel":
+            guard let enabled = request.enabled else { throw HelperError("setBlockOutsideTunnel requires enabled") }
+            HelperSettings.blockOutsideTunnel = enabled
+            log("Setting: block traffic outside the tunnel \(enabled ? "on" : "off")")
+            engine.applySettings()
+            return IPCResponse(ok: true, blockOutsideTunnel: HelperSettings.blockOutsideTunnel)
 
         default:
             throw HelperError("Unknown command: \(request.cmd)")

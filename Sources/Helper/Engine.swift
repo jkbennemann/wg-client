@@ -16,6 +16,15 @@ final class Engine {
         /// The tunnel's `DNS =` entries, re-applied after network changes. nil in state
         /// written by older helpers; read back from the stored config then.
         var dns: [String]?
+        /// What keeps traffic from bypassing the tunnel; nil in state from older helpers.
+        var bypass: BypassState?
+    }
+
+    /// The scoped default routes and pf rules managed by `enforceBypassPolicy`.
+    struct BypassState: Codable {
+        var scopedDefaults: [NetworkSetup.ScopedDefault] = []
+        var pfToken: String?
+        var pfRules: String?
     }
 
     static let stateDir = "/var/run/wg-client"
@@ -24,6 +33,7 @@ final class Engine {
 
     private let lock = NSLock()
     private var child: Process?
+    private var exitWatch: DispatchSourceProcess?
     /// The network the last reconcile saw, so each change is logged once.
     private var lastNetwork: String?
 
@@ -49,12 +59,17 @@ final class Engine {
     /// Called at startup: if a previous helper instance left state behind and the
     /// wireguard-go process is gone, undo its DNS/route changes.
     func reconcileOnStartup() {
-        guard let state = activeState else { return }
+        guard let state = activeState else {
+            // Rules left by a helper that died mid-teardown would block the physical network.
+            PacketFilter.clear()
+            return
+        }
         if kill(state.pid, 0) != 0 {
             log("Stale state for tunnel \(state.name) (pid \(state.pid) gone), cleaning up")
             cleanup(state, killProcess: false)
         } else {
             log("Adopted running tunnel \(state.name) on \(state.iface) (pid \(state.pid))")
+            watchForExit(pid: state.pid)
         }
     }
 
@@ -64,12 +79,20 @@ final class Engine {
         let overallStart = DispatchTime.now()
         let config = try TunnelConfig.parse(configText)
         let current = activeState
+        let networks = config.peers.flatMap { $0.allowedIPs }.map(UAPI.normalizeCIDR)
+        var bypass = current?.bypass ?? BypassState()
 
         // Bring the NEW tunnel fully onto its own interface first — the old tunnel (if
         // any) is untouched and keeps carrying traffic throughout. This is the only
         // step allowed to throw: if it fails, the old tunnel is never disturbed and its
         // own cleanup runs inside bringUpInterface.
-        let (process, iface, pins) = try bringUpInterface(config: config, start: overallStart)
+        let (process, iface, pins) = try bringUpInterface(config: config, start: overallStart) { pins in
+            // The old tunnel's rules only let its own endpoints through; the pins are about
+            // to send the new tunnel's handshake out the physical network.
+            guard let current, bypass.pfRules != nil else { return }
+            enforceBypassPolicy(&bypass, families: NetworkSetup.fullTunnelFamilies(networks: current.networks),
+                                endpoints: (current.hostRoutes + pins).map(\.dest))
+        }
 
         // From here the new interface is up and able to carry traffic. Everything below
         // is best-effort finalization: a secondary failure (DNS store, status file)
@@ -116,17 +139,25 @@ final class Engine {
             }
         }
 
+        // Only now that the tunnel owns the default route: strict rules loaded earlier
+        // would block the physical network's ordinary traffic.
+        enforceBypassPolicy(&bypass, families: NetworkSetup.fullTunnelFamilies(networks: networks),
+                            endpoints: pins.map(\.dest))
+        _ = phase("route connections opened before connecting", since: lastStamp)
+
         let state = ActiveState(
             name: name,
             pid: process.processIdentifier,
             iface: iface,
-            networks: config.peers.flatMap { $0.allowedIPs }.map(UAPI.normalizeCIDR),
+            networks: networks,
             hostRoutes: pins,
             dnsBackup: dnsBackup,
-            dns: config.interface.dns
+            dns: config.interface.dns,
+            bypass: bypass
         )
         save(state)
         child = process
+        watchForExit(pid: process.processIdentifier)
         // Connections opened before this (direct, or through the previous tunnel) can't
         // carry traffic anymore; let apps that listen for network changes drop them.
         NetworkMonitor.announceChange()
@@ -138,7 +169,8 @@ final class Engine {
     /// the interface up with its addresses, and pins the peer endpoints via the physical
     /// gateway. Does NOT install network routes, DNS, or persist state — so it never
     /// disturbs an already-active tunnel. Returns the process, interface, and pin routes.
-    private func bringUpInterface(config: TunnelConfig, start: DispatchTime) throws -> (Process, String, [NetworkSetup.HostRoute]) {
+    private func bringUpInterface(config: TunnelConfig, start: DispatchTime,
+                                  beforePinning: ([NetworkSetup.HostRoute]) -> Void) throws -> (Process, String, [NetworkSetup.HostRoute]) {
         let wgGoPath = helperDir + "/wireguard-go"
         guard FileManager.default.isExecutableFile(atPath: wgGoPath) else {
             throw HelperError("wireguard-go not found at \(wgGoPath) — reinstall the helper")
@@ -189,6 +221,7 @@ final class Engine {
             try NetworkSetup.configureInterface(iface: iface, config: config)
             lastStamp = phase("configure interface", since: lastStamp)
             let pins = NetworkSetup.endpointHostRoutes(config: config, resolvedEndpoints: resolvedEndpoints)
+            beforePinning(pins)
             NetworkSetup.installHostRoutes(pins)
             _ = phase("pin endpoints", since: lastStamp)
             return (process, iface, pins)
@@ -236,6 +269,11 @@ final class Engine {
         }
         state.hostRoutes = pins
 
+        var bypass = state.bypass ?? BypassState()
+        enforceBypassPolicy(&bypass, families: NetworkSetup.fullTunnelFamilies(networks: state.networks),
+                            endpoints: pins.map(\.dest))
+        state.bypass = bypass
+
         let dns = state.dns ?? (try? TunnelStore.read(name: state.name))
             .flatMap { try? TunnelConfig.parse($0) }?.interface.dns ?? []
         state.dns = dns
@@ -251,6 +289,89 @@ final class Engine {
             }
         }
         save(state)
+    }
+
+    /// Applies a changed `HelperSettings.blockOutsideTunnel` to the active tunnel, if any.
+    func applySettings() {
+        lock.lock(); defer { lock.unlock() }
+        guard var state = activeState, kill(state.pid, 0) == 0 else { return }
+        var bypass = state.bypass ?? BypassState()
+        enforceBypassPolicy(&bypass, families: NetworkSetup.fullTunnelFamilies(networks: state.networks),
+                            endpoints: state.hostRoutes.map(\.dest))
+        state.bypass = bypass
+        save(state)
+    }
+
+    /// Decides what happens to traffic that would leave outside a full tunnel: connections
+    /// opened before it came up, and sockets bound to the physical interface. Either way
+    /// it gets a route again (see `NetworkSetup.ScopedDefault`); with `blockOutsideTunnel`
+    /// pf rejects it on the physical interface so apps reconnect through the tunnel at
+    /// once, otherwise it carries on outside the tunnel until it closes. If the rules can't
+    /// be loaded no route is added either: that traffic then stalls, but never leaks.
+    private func enforceBypassPolicy(_ bypass: inout BypassState, families: Set<String>, endpoints: [String]) {
+        let defaults = NetworkSetup.physicalDefaults(families: families)
+        var routed = defaults
+        if HelperSettings.blockOutsideTunnel, !defaults.isEmpty {
+            let rules = PacketFilter.bypassRules(defaults: defaults, endpoints: endpoints)
+            if bypass.pfToken == nil || !PacketFilter.isEnabled {
+                // A token is void once pf was switched off with `pfctl -d`.
+                if let token = bypass.pfToken { PacketFilter.release(token) }
+                bypass.pfToken = PacketFilter.enable()
+            }
+            if bypass.pfToken != nil, rules == bypass.pfRules || PacketFilter.load(rules) {
+                if bypass.pfRules == nil {
+                    log("Blocking traffic outside the tunnel on " + Set(defaults.map(\.iface)).sorted().joined(separator: ", "))
+                }
+                bypass.pfRules = rules
+            } else {
+                log("Warning: could not set up pf; connections opened before connecting stall until they time out")
+                clearBypassRules(&bypass)
+                routed = []
+            }
+        } else if bypass.pfRules != nil || bypass.pfToken != nil {
+            clearBypassRules(&bypass)
+            if !HelperSettings.blockOutsideTunnel {
+                log("No longer blocking traffic outside the tunnel")
+            }
+        }
+
+        let owned = NetworkSetup.refreshScopedDefaults(bypass.scopedDefaults, desired: routed)
+        if owned != bypass.scopedDefaults {
+            let summary = owned.map { "\($0.iface) via \($0.gateway)" }
+            log("Route for connections opened before connecting: " + (summary.isEmpty ? "none" : summary.joined(separator: ", ")))
+        }
+        bypass.scopedDefaults = owned
+    }
+
+    private func clearBypassRules(_ bypass: inout BypassState) {
+        if bypass.pfRules != nil {
+            PacketFilter.clear()
+        }
+        if let token = bypass.pfToken {
+            PacketFilter.release(token)
+        }
+        bypass.pfRules = nil
+        bypass.pfToken = nil
+    }
+
+    /// wireguard-go dying on its own takes the tunnel's routes with its utun but leaves the
+    /// endpoint pins, the DNS override, and the pf rules, which would cut the Mac off the
+    /// physical network. Clean up as if the tunnel had been switched off.
+    private func watchForExit(pid: Int32) {
+        exitWatch?.cancel()
+        let source = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .global())
+        source.setEventHandler { [weak self] in self?.tunnelProcessExited(pid: pid) }
+        source.resume()
+        exitWatch = source
+    }
+
+    private func tunnelProcessExited(pid: Int32) {
+        lock.lock(); defer { lock.unlock() }
+        // A tunnel we switched away from or took down ourselves no longer owns the state.
+        guard let state = activeState, state.pid == pid else { return }
+        log("wireguard-go for \(state.name) exited unexpectedly; removing its routes, DNS and firewall rules")
+        cleanup(state, killProcess: false)
+        NetworkMonitor.announceChange()
     }
 
     private func save(_ state: ActiveState) {
@@ -292,6 +413,11 @@ final class Engine {
         if let dnsBackup = state.dnsBackup {
             DNSManager.restore(dnsBackup)
         }
+        // Before the tunnel's routes vanish: from then on the physical network carries all
+        // traffic, and the rules would block it.
+        var bypass = state.bypass ?? BypassState()
+        bypass.scopedDefaults = NetworkSetup.refreshScopedDefaults(bypass.scopedDefaults, desired: [])
+        clearBypassRules(&bypass)
         if killProcess {
             terminateProcess(pid: state.pid)
         }

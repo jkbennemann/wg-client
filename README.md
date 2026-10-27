@@ -124,6 +124,15 @@ can also stamp the version via `WG_VERSION`; `IPC.build` triggers the in-app
 5. **Manage Tunnels** shows interface/peer details, live handshake and transfer
    stats, and lets you edit, rename (Rename… button or right-click a tunnel in
    the list), or delete configs.
+6. **Block Traffic Outside the Tunnel** (on by default) decides what happens to
+   traffic that would bypass a full tunnel (`0.0.0.0/0` / `::/0`): connections
+   opened before connecting, and sockets bound to Wi-Fi/Ethernet. On, the helper
+   rejects it with pf (TCP reset, UDP port-unreachable) so apps reconnect through
+   the tunnel within seconds; the local subnet, multicast, DHCP and the endpoint
+   stay reachable. Off, those connections keep running outside the tunnel until
+   they close. Either way the helper adds a default route scoped to the physical
+   interface: without it, macOS drops such packets as unroutable and apps hang for
+   20–30 s after connecting.
 
 Switching directly from one active tunnel to another performs a **make-before-break
 handover**: the incoming tunnel is fully brought up on its own interface while the
@@ -225,11 +234,8 @@ list optimistically before the helper round-trip completes.
 
 ## Known limitations
 
-- If the network changes while a full-tunnel config is active (e.g. Wi-Fi →
-  LAN), the pinned endpoint route may point at the old gateway; toggle the
-  tunnel to re-establish. (The official client runs a route monitor for this.)
-- DNS is set by overriding the primary service's dynamic-store DNS entry. If
-  DHCP renews mid-session it can republish that key and briefly override the
-  tunnel DNS until the tunnel is toggled. A dynamic-store watcher (like the route
-  monitor above) would close this gap.
+- After switching tunnels or disconnecting, connections opened through the
+  previous tunnel keep its now-gone address and hang until the app times them
+  out (typically 10–30 s for WebSockets and Node apps). Chromium-based apps drop
+  their pooled HTTP connections right away, since the helper announces each change.
 - No on-demand activation.

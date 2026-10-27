@@ -84,4 +84,8 @@ enum HelperClient {
     static func fetchLog() throws -> String {
         try request(IPCRequest(cmd: "log"), timeout: 10).log ?? ""
     }
+
+    static func setBlockOutsideTunnel(_ enabled: Bool) throws {
+        try request(IPCRequest(cmd: "setBlockOutsideTunnel", enabled: enabled), timeout: 30)
+    }
 }

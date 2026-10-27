@@ -15,6 +15,8 @@ final class AppState: ObservableObject {
     @Published var activeTunnel: String?
     @Published var activeNetworks: [String] = []
     @Published var activeStatus: TunnelStatus?
+    /// Helper setting; on by default, so assume so until the helper says otherwise.
+    @Published var blockOutsideTunnel: Bool = true
 
     /// Set the instant the user triggers activate/deactivate so the UI reflects the
     /// in-progress state immediately instead of waiting for the helper round-trip.
@@ -42,6 +44,7 @@ final class TunnelController {
             var active: String?
             var networks: [String] = []
             var status: TunnelStatus?
+            var blockOutsideTunnel: Bool?
 
             if let hello = try? HelperClient.hello() {
                 if hello.version != IPC.protocolVersion || hello.build != IPC.build {
@@ -52,6 +55,7 @@ final class TunnelController {
                         tunnels = listResponse.tunnels ?? []
                         active = listResponse.activeTunnel
                         networks = listResponse.activeNetworks ?? []
+                        blockOutsideTunnel = listResponse.blockOutsideTunnel
                     }
                     if active != nil, let statusResponse = try? HelperClient.status() {
                         status = statusResponse.status
@@ -65,6 +69,7 @@ final class TunnelController {
                 self.state.activeTunnel = active
                 self.state.activeNetworks = networks
                 self.state.activeStatus = status
+                if let blockOutsideTunnel { self.state.blockOutsideTunnel = blockOutsideTunnel }
                 completion?()
             }
         }
@@ -87,6 +92,12 @@ final class TunnelController {
     private func markBusy(_ label: String) {
         state.busy = true
         state.busyLabel = label
+    }
+
+    func setBlockOutsideTunnel(_ enabled: Bool) {
+        // Optimistic, like delete/rename: the refresh after the call reconciles.
+        state.blockOutsideTunnel = enabled
+        performInBackground { try HelperClient.setBlockOutsideTunnel(enabled) }
     }
 
     func toggle(_ name: String) {

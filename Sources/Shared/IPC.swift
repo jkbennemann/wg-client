@@ -7,7 +7,7 @@ public enum IPC {
     /// Bumped whenever the helper binary's behavior changes without a wire-protocol
     /// break. The app compares the running helper's reported build against its own
     /// and offers to reinstall on a mismatch, so rebuilds actually take effect.
-    public static let build = "0.0.2"
+    public static let build = "0.0.3"
 }
 
 public struct IPCRequest: Codable {
@@ -15,12 +15,16 @@ public struct IPCRequest: Codable {
     public var name: String?
     public var newName: String?
     public var config: String?
+    /// Value for on/off settings (`setBlockOutsideTunnel`).
+    public var enabled: Bool?
 
-    public init(cmd: String, name: String? = nil, newName: String? = nil, config: String? = nil) {
+    public init(cmd: String, name: String? = nil, newName: String? = nil, config: String? = nil,
+                enabled: Bool? = nil) {
         self.cmd = cmd
         self.name = name
         self.newName = newName
         self.config = config
+        self.enabled = enabled
     }
 }
 
@@ -78,11 +82,13 @@ public struct IPCResponse: Codable {
     public var status: TunnelStatus?
     public var config: String?
     public var log: String?
+    /// Whether traffic that would bypass an active full tunnel is blocked (helper setting).
+    public var blockOutsideTunnel: Bool?
 
     public init(ok: Bool, error: String? = nil, version: Int? = nil, build: String? = nil,
                 activeTunnel: String? = nil, activeNetworks: [String]? = nil,
                 tunnels: [TunnelInfo]? = nil, status: TunnelStatus? = nil, config: String? = nil,
-                log: String? = nil) {
+                log: String? = nil, blockOutsideTunnel: Bool? = nil) {
         self.ok = ok
         self.error = error
         self.version = version
@@ -93,5 +99,6 @@ public struct IPCResponse: Codable {
         self.status = status
         self.config = config
         self.log = log
+        self.blockOutsideTunnel = blockOutsideTunnel
     }
 }
