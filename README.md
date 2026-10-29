@@ -90,8 +90,9 @@ Release, installed via a Homebrew Cask hosted in a separate tap repo.
 Releases are cut locally; there is no CI release pipeline (it would need the
 Developer ID key, Apple credentials and a tap token stored as repo secrets).
 
-1. Bump `CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist`
-   and `IPC.build` in `Sources/Shared/IPC.swift` (see below), commit.
+1. Bump `CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist`,
+   and `IPC.build` in `Sources/Shared/IPC.swift` if the helper changed (see below),
+   commit.
 2. Build, sign, notarize, staple and zip:
    ```sh
    export CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
@@ -108,10 +109,11 @@ Developer ID key, Apple credentials and a tap token stored as repo secrets).
    cask must match this repo's file, not just its version and checksum: stanzas
    such as `uninstall` change with the app.
 
-Bump `CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist` and
-`IPC.build` in `Sources/Shared/IPC.swift` to match each release (the build script
-can also stamp the version via `WG_VERSION`; `IPC.build` triggers the in-app
-"update helper" prompt when the helper changes).
+`CFBundleShortVersionString`/`CFBundleVersion` in `Resources/Info.plist` change with
+every release (the build script can also stamp them via `WG_VERSION`). `IPC.build` in
+`Sources/Shared/IPC.swift` changes only when the helper binary does: the app compares
+it with the running helper's and asks to update the helper on a mismatch, which costs
+users an admin prompt.
 
 ## Usage
 
@@ -154,14 +156,15 @@ ignored with a warning.
 **Update:**
 
 ```sh
-brew upgrade --cask wg-client
+brew update && brew upgrade --cask wg-client
 ```
 
-Homebrew quits the app, unloads and removes the old privileged helper, and installs
-the new app (one admin prompt for the helper files). Your **tunnel configs are
-preserved** (they live in `/Library/Application Support/WGClient`, which upgrades
-don't touch). On next launch the app reinstalls its helper — expected, since the
-helper version changed.
+`brew update` refreshes the tap; without it Homebrew may not see a new release yet.
+Homebrew quits the app, unloads and removes the old privileged helper, installs the
+new app and reopens it (one admin prompt for the helper files). Your **tunnel configs
+are preserved** (they live in `/Library/Application Support/WGClient`, which upgrades
+don't touch). The menu then shows **Install Helper…**: click it and enter your
+password once more.
 
 **Uninstall (keeps tunnel configs):**
 
@@ -202,6 +205,43 @@ Then drag the app to the Trash.
 - `swift run WireGuardClient` works for UI development, but helper
   installation needs the full bundle from `scripts/build-app.sh` (the helper
   binary and `wireguard-go` are bundle resources).
+
+### "Helper installation failed … Bootstrap failed: 5: Input/output error" (macOS 27)
+
+macOS 27's launchd refuses to load a background service whose files carry the
+quarantine flag, and Homebrew sets that flag on every app it installs. WG Client
+0.0.3 and earlier copied it onto the installed helper, so after updating to macOS 27
+the helper no longer starts, and installing it again from the app fails with this
+error. 0.0.4 removes the flag when it installs the helper.
+
+**Fix:** update WG Client, then install the helper again:
+
+```sh
+brew update && brew upgrade --cask wg-client
+```
+
+Then choose **Install Helper…** in the menu-bar menu.
+
+**If you can't update right away**, remove the flag from the installed helper files
+and start the helper by hand (the files are in place after any earlier install,
+including the failed attempt):
+
+```sh
+sudo xattr -d com.apple.quarantine \
+    /Library/LaunchDaemons/com.github.jkbennemann.wg-client.helper.plist \
+    /Library/PrivilegedHelperTools/WGClient/wireguard-client-helper \
+    /Library/PrivilegedHelperTools/WGClient/wireguard-go
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.github.jkbennemann.wg-client.helper.plist
+```
+
+To confirm this is the cause, look for launchd's refusal in the system log (in zsh,
+`log` is a shell builtin, hence the full path):
+
+```sh
+/usr/bin/log show --last 15m --predicate 'process == "launchd"' | grep -i "wg-client.*quarantine"
+```
+
+It shows `Refusing to execute/trust quarantined program/file`.
 
 ## Connect/disconnect performance
 
