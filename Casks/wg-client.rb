@@ -1,6 +1,6 @@
 cask "wg-client" do
-  version "0.0.3"
-  sha256 "994b43ed73dfaa489592b2e40c08570129a1c5939e578906926b73aacf9d5757"
+  version "0.0.4"
+  sha256 "4162e7ee18ab6471ffd6ab0330302f4c4dcaeca0a066b3395e01598565b2f3ce"
 
   url "https://github.com/jkbennemann/wg-client/releases/download/v#{version}/WG-Client-#{version}.zip"
   name "WG Client"
