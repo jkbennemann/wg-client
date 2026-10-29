@@ -31,5 +31,12 @@ mkdir -p "/Library/Application Support/WGClient/tunnels"
 chown -R root:wheel "/Library/Application Support/WGClient"
 chmod 700 "/Library/Application Support/WGClient/tunnels"
 
+# Homebrew quarantines what it downloads, and copying out of the app bundle carries the
+# flag along (copyfile propagates it even with `cp -X`). launchd on macOS 27+ refuses a
+# daemon whose plist or program is quarantined: "Bootstrap failed: 5: Input/output error".
+for f in "$DEST/wireguard-client-helper" "$DEST/wireguard-go" "/Library/LaunchDaemons/$LABEL.plist"; do
+    xattr -d com.apple.quarantine "$f" 2>/dev/null || true
+done
+
 launchctl bootstrap system "/Library/LaunchDaemons/$LABEL.plist"
 echo "Helper installed."
