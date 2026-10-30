@@ -21,8 +21,10 @@ This taps `jkbennemann/homebrew-tap` automatically and installs `WG Client.app`
 into `/Applications`. Launch it, and on first run it will offer to install its
 privileged helper (one admin prompt).
 
-To upgrade: `brew upgrade --cask wg-client`. To remove: `brew uninstall --cask
-wg-client` (add `--zap` to also delete stored tunnel configs).
+To upgrade: `brew update && brew upgrade --cask wg-client`, then click **Install
+Helper…** in the menu (see [Updating & uninstalling](#updating--uninstalling)). To
+remove: `brew uninstall --cask wg-client` (add `--zap` to also delete stored tunnel
+configs).
 
 ## How it works
 
